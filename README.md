@@ -279,27 +279,7 @@ aws cloudformation wait stack-delete-complete --stack-name lambda-retry-infinite
 aws cloudformation wait stack-delete-complete --stack-name lambda-retry-dlq
 ```
 
-## 🎭 Demo Presentation Script
 
-### Part 1: Introduce the Problem (5 minutes)
-1. Show architecture diagram
-2. Explain poison pill concept
-3. Deploy infinite retry stack
-4. Upload `test-data-poison-pill.json`
-5. Show CloudWatch logs with continuous retries
-
-### Part 2: Demonstrate the Solution (5 minutes)
-1. Deploy DLQ handling stack
-2. Upload same poison pill data
-3. Show exactly 4 retry attempts
-4. Show records in DLQ
-5. Explain cost and resource benefits
-
-### Part 3: Best Practices (5 minutes)
-1. Upload `test-data-valid.json` to show normal processing
-2. Review configuration differences
-3. Discuss monitoring strategies
-4. Show DLQ message inspection
 
 ## 📚 Additional Resources
 
