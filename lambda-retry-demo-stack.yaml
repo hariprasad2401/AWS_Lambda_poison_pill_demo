@@ -1,0 +1,381 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Lambda Retry Demo - Two flows to demonstrate infinite retries vs proper DLQ handling'
+
+Parameters:
+  FlowType:
+    Type: String
+    Default: 'infinite-retry'
+    AllowedValues:
+      - 'infinite-retry'
+      - 'dlq-handling'
+    Description: 'Choose flow type: infinite-retry (no DLQ, default retries) or dlq-handling (max retries=3 with DLQ)'
+
+Conditions:
+  IsInfiniteRetryFlow: !Equals [!Ref FlowType, 'infinite-retry']
+  IsDLQHandlingFlow: !Equals [!Ref FlowType, 'dlq-handling']
+
+Resources:
+  # S3 Bucket for JSON file uploads
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-data-bucket-${AWS::AccountId}'
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt S3ToDynamoDBLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .json
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # DynamoDB Table with Streams enabled
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-dynotbl-1'
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  # SQS Dead Letter Queue (only for DLQ flow)
+  PoisonPillDLQ:
+    Type: AWS::SQS::Queue
+    Condition: IsDLQHandlingFlow
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-poison-pill-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 60
+
+  # IAM Role for S3 to DynamoDB Lambda
+  S3ToDynamoDBLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub '${DataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt DynamoDBTable.Arn
+
+  # IAM Role for DynamoDB Validation Lambda (Infinite Retry Flow)
+  DynamoDBValidationLambdaRoleInfinite:
+    Type: AWS::IAM::Role
+    Condition: IsInfiniteRetryFlow
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBStreamAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource: !GetAtt DynamoDBTable.StreamArn
+
+  # IAM Role for DynamoDB Validation Lambda (DLQ Flow)
+  DynamoDBValidationLambdaRoleDLQ:
+    Type: AWS::IAM::Role
+    Condition: IsDLQHandlingFlow
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBStreamAndSQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource: !GetAtt DynamoDBTable.StreamArn
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt PoisonPillDLQ.Arn
+
+  # Lambda Function: S3 to DynamoDB
+  S3ToDynamoDBLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-s3-to-dynamodb'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt S3ToDynamoDBLambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          DDB_TABLE_NAME: !Ref DynamoDBTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          dynamodb = boto3.resource('dynamodb')
+          table_name = os.environ['DDB_TABLE_NAME']
+          table = dynamodb.Table(table_name)
+          s3 = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              print("Received event:", json.dumps(event))
+
+              # Get bucket and object key from S3 event
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = event['Records'][0]['s3']['object']['key']
+              
+              print(f"Processing file: s3://{bucket}/{key}")
+
+              try:
+                  # Download JSON file
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  content = response['Body'].read()
+                  records = json.loads(content)
+                  
+                  print(f"Found {len(records)} records to process")
+
+                  # Insert each record into DynamoDB
+                  for i, record in enumerate(records):
+                      print(f"Inserting record {i+1}: {record}")
+                      
+                      # Ensure id is string for DynamoDB
+                      if 'id' in record:
+                          record['id'] = str(record['id'])
+                      
+                      table.put_item(Item=record)
+
+                  return {
+                      'statusCode': 200,
+                      'body': f'Successfully inserted {len(records)} records into DynamoDB'
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing file: {str(e)}")
+                  raise
+
+  # Lambda Function: DynamoDB Validation (Infinite Retry Flow)
+  DynamoDBValidationLambdaInfinite:
+    Type: AWS::Lambda::Function
+    Condition: IsInfiniteRetryFlow
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-dynamodb-validation-infinite'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DynamoDBValidationLambdaRoleInfinite.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+
+          def lambda_handler(event, context):
+              print("🔄 INFINITE RETRY FLOW - No DLQ configured")
+              print("Received records:", json.dumps(event))
+
+              # Process each record
+              for record in event['Records']:
+                  new_image = record['dynamodb']['NewImage']
+                  print("Processing record:", new_image)
+
+                  # Expect 'value' field to exist
+                  if 'value' not in new_image:
+                      print("❌ POISON PILL DETECTED - This will cause INFINITE RETRIES!")
+                      # Throw exception -> poison pill will cause entire batch to fail
+                      raise Exception(f"Malformed record detected: {new_image}")
+
+                  print(f"✅ Successfully processed record with id: {new_image['id']['S']}")
+
+              return {
+                  'statusCode': 200
+              }
+
+  # Lambda Function: DynamoDB Validation (DLQ Flow)
+  DynamoDBValidationLambdaDLQ:
+    Type: AWS::Lambda::Function
+    Condition: IsDLQHandlingFlow
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-dynamodb-validation-dlq'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DynamoDBValidationLambdaRoleDLQ.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+
+          def lambda_handler(event, context):
+              print("🛡️ DLQ FLOW - Max retries=3, DLQ configured")
+              print("Received records:", json.dumps(event))
+
+              # Process each record in the event
+              for record in event['Records']:
+                  # Extract the new image from the DynamoDB stream record
+                  new_image = record['dynamodb']['NewImage']
+                  print("Processing record:", new_image)
+
+                  # Check if the 'value' field exists in the record
+                  if 'value' not in new_image:
+                      print("❌ POISON PILL DETECTED - Will retry 3 times then send to DLQ")
+                      # If missing, raise an exception (this is a poison pill scenario)
+                      # The entire batch will fail and be retried due to this exception
+                      raise Exception(f"Malformed record detected: {new_image}")
+
+                  # If 'value' exists, process the record (here, just print the id)
+                  print(f"✅ Successfully processed record with id: {new_image['id']['S']}")
+
+              # Return a successful response
+              return {
+                  'statusCode': 200
+              }
+
+  # Permission for S3 to invoke Lambda
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref S3ToDynamoDBLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${DataBucket}/*'
+
+  # Event Source Mapping: DynamoDB Stream to Lambda (Infinite Retry Flow)
+  DynamoDBStreamEventSourceMappingInfinite:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: IsInfiniteRetryFlow
+    Properties:
+      EventSourceArn: !GetAtt DynamoDBTable.StreamArn
+      FunctionName: !GetAtt DynamoDBValidationLambdaInfinite.Arn
+      StartingPosition: LATEST
+      BatchSize: 10
+      # No MaximumRetryAttempts specified = infinite retries (default -1)
+      # No DestinationConfig = no DLQ
+
+  # Event Source Mapping: DynamoDB Stream to Lambda (DLQ Flow)
+  DynamoDBStreamEventSourceMappingDLQ:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: IsDLQHandlingFlow
+    Properties:
+      EventSourceArn: !GetAtt DynamoDBTable.StreamArn
+      FunctionName: !GetAtt DynamoDBValidationLambdaDLQ.Arn
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumRetryAttempts: 3  # Retry 3 times then send to DLQ
+      MaximumRecordAgeInSeconds: 3600  # 1 hour
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt PoisonPillDLQ.Arn
+
+Outputs:
+  FlowType:
+    Description: 'Current flow configuration'
+    Value: !Ref FlowType
+    
+  S3BucketName:
+    Description: 'S3 bucket name for uploading JSON files'
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3Bucket'
+      
+  DynamoDBTableName:
+    Description: 'DynamoDB table name'
+    Value: !Ref DynamoDBTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTable'
+      
+  S3ToDynamoDBLambdaName:
+    Description: 'S3 to DynamoDB Lambda function name'
+    Value: !Ref S3ToDynamoDBLambda
+    Export:
+      Name: !Sub '${AWS::StackName}-S3Lambda'
+      
+  ValidationLambdaName:
+    Description: 'DynamoDB validation Lambda function name'
+    Value: !If 
+      - IsInfiniteRetryFlow
+      - !Ref DynamoDBValidationLambdaInfinite
+      - !Ref DynamoDBValidationLambdaDLQ
+    Export:
+      Name: !Sub '${AWS::StackName}-ValidationLambda'
+      
+  PoisonPillDLQName:
+    Condition: IsDLQHandlingFlow
+    Description: 'SQS Dead Letter Queue name for poison pill records'
+    Value: !Ref PoisonPillDLQ
+    Export:
+      Name: !Sub '${AWS::StackName}-DLQ'
+      
+  TestingInstructions:
+    Description: 'How to test the flows'
+    Value: !Sub |
+      TESTING INSTRUCTIONS:
+      
+      1. Upload test JSON file to S3 bucket: ${DataBucket}
+      
+      2. For INFINITE RETRY testing, use this JSON (missing 'value' fields):
+      [
+        {"id": "1", "name": "John Doe"},
+        {"id": "2", "name": "Jane Smith"}
+      ]
+      
+      3. For SUCCESS testing, use this JSON (has 'value' fields):
+      [
+        {"id": "1", "name": "John Doe", "value": "valid_data_1"},
+        {"id": "2", "name": "Jane Smith", "value": "valid_data_2"}
+      ]
+      
+      4. Monitor CloudWatch Logs for:
+         - S3 Lambda: ${S3ToDynamoDBLambda}
+         - Validation Lambda: ${!If [IsInfiniteRetryFlow, !Ref DynamoDBValidationLambdaInfinite, !Ref DynamoDBValidationLambdaDLQ]}
+      
+      5. Current Flow: ${FlowType}
+         ${!If [IsInfiniteRetryFlow, "⚠️ Will show INFINITE RETRIES", "✅ Will retry 3 times then send to DLQ"]}
